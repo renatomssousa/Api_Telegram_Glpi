@@ -1,11 +1,13 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
-from typing import Optional
+# -*- coding: utf-8 -*-
+
+from fastapi import FastAPI, Request
 import requests
 import os
+import json
+import urllib3
 from dotenv import load_dotenv
 from datetime import datetime
-import urllib3
+from pathlib import Path
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -20,26 +22,40 @@ GLPI_API_URL = os.getenv("GLPI_API_URL", f"{GLPI_URL_BASE}/apirest.php")
 GLPI_APP_TOKEN = os.getenv("GLPI_APP_TOKEN")
 GLPI_USER_TOKEN = os.getenv("GLPI_USER_TOKEN")
 
-MAPA_GRUPOS = {
-    98: "Raiz"
-}
+STATE_FILE = Path("estado_main.json")
 
 MAPA_TECNICOS = {
-    "otoniel.dias@petacorp.com.br": "@otoniel"
+    # Exemplo:
+    # "otoniel.dias@petacorp.com.br": "@otoniel",
+    # "Otoniel Dias": "@otoniel",
 }
 
 
-class ItemPayload(BaseModel):
-    id: Optional[str] = None
-    name: Optional[str] = None
+def carregar_estado():
+    if not STATE_FILE.exists():
+        return {"tickets": {}}
+
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                data.setdefault("tickets", {})
+                return data
+    except Exception as e:
+        print("Erro ao carregar estado_main.json:", e)
+
+    return {"tickets": {}}
 
 
-class WebhookPayload(BaseModel):
-    id: Optional[str] = None
-    ticket_id: Optional[str] = None
-    tickets_id: Optional[str] = None
-    event: Optional[str] = None
-    item: Optional[ItemPayload] = None
+def salvar_estado(estado):
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(estado, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("Erro ao salvar estado_main.json:", e)
+
+
+ESTADO = carregar_estado()
 
 
 def enviar_telegram(texto):
@@ -52,7 +68,8 @@ def enviar_telegram(texto):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": texto
+        "text": texto,
+        "disable_web_page_preview": True
     }
 
     try:
@@ -113,25 +130,24 @@ def get_glpi(endpoint, session_token, params=None):
     return requests.get(url, headers=headers, params=params, timeout=20, verify=False)
 
 
-def traduzir_status(status):
-    mapa = {
-        1: "Novo",
-        2: "Em atendimento (atribuido)",
-        3: "Em planejamento",
-        4: "Pendente",
-        5: "Solucionado",
-        6: "Fechado"
-    }
-    if isinstance(status, int):
-        return mapa.get(status, str(status))
-    return str(status) if status is not None else "Nao informado"
+def normalizar_lista_api(data):
+    if isinstance(data, dict) and "data" in data:
+        data = data["data"]
+
+    if isinstance(data, list):
+        return data
+
+    return []
 
 
 def buscar_ticket(ticket_id, session_token):
     response = get_glpi(f"Ticket/{ticket_id}", session_token)
 
     if not response.ok:
-        raise Exception(f"Erro ao buscar Ticket/{ticket_id}: status={response.status_code} resposta={response.text}")
+        raise Exception(
+            f"Erro ao buscar Ticket/{ticket_id}: "
+            f"status={response.status_code} resposta={response.text}"
+        )
 
     try:
         return response.json()
@@ -139,34 +155,7 @@ def buscar_ticket(ticket_id, session_token):
         raise Exception(f"Resposta invalida ao buscar Ticket/{ticket_id}: {response.text}")
 
 
-def buscar_nome_usuario(users_id, session_token):
-    if not users_id:
-        return None
-
-    response = get_glpi(f"User/{users_id}", session_token)
-
-    if not response.ok:
-        return None
-
-    try:
-        data = response.json()
-        return data.get("name") or data.get("realname") or f"Usuario {users_id}"
-    except Exception:
-        return None
-
-
 def buscar_nome_grupo(groups_id, session_token):
-    if not groups_id:
-        return None
-
-    try:
-        groups_id_int = int(groups_id)
-    except Exception:
-        groups_id_int = groups_id
-
-    if groups_id_int in MAPA_GRUPOS:
-        return MAPA_GRUPOS[groups_id_int]
-
     response = get_glpi(f"Group/{groups_id}", session_token)
 
     if not response.ok:
@@ -179,61 +168,215 @@ def buscar_nome_grupo(groups_id, session_token):
         return f"Grupo {groups_id}"
 
 
-def buscar_grupos_tecnicos(ticket_id, session_token):
-    tecnicos = []
+def buscar_usuario(users_id, session_token):
+    response = get_glpi(f"User/{users_id}", session_token)
+
+    if not response.ok:
+        return {
+            "id": users_id,
+            "nome": f"Usuario {users_id}",
+            "email": None
+        }
+
+    try:
+        data = response.json()
+    except Exception:
+        return {
+            "id": users_id,
+            "nome": f"Usuario {users_id}",
+            "email": None
+        }
+
+    nome = data.get("realname") or data.get("name") or f"Usuario {users_id}"
+    email = data.get("email")
+
+    return {
+        "id": users_id,
+        "nome": nome,
+        "email": email
+    }
+
+
+def formatar_tecnico(tecnico):
+    nome = tecnico.get("nome") or "Nao informado"
+    email = tecnico.get("email")
+
+    if email and email in MAPA_TECNICOS:
+        return MAPA_TECNICOS[email]
+
+    if nome in MAPA_TECNICOS:
+        return MAPA_TECNICOS[nome]
+
+    return nome
+
+
+def buscar_grupos_ticket(ticket_id, session_token):
     grupos = []
 
-    resp_users = get_glpi(f"Ticket/{ticket_id}/Ticket_User", session_token)
-    if resp_users.ok:
+    response = get_glpi(f"Ticket/{ticket_id}/Group_Ticket", session_token)
+    if not response.ok:
+        return grupos
+
+    try:
+        itens = normalizar_lista_api(response.json())
+    except Exception:
+        return grupos
+
+    for item in itens:
         try:
-            for item in resp_users.json():
-                if int(item.get("type", 0)) == 2:
-                    nome = buscar_nome_usuario(item.get("users_id"), session_token)
-                    if nome:
-                        tecnicos.append(nome)
-        except Exception as e:
-            print("Erro Ticket_User:", e)
-            print("Resposta Ticket_User:", resp_users.text)
+            if int(item.get("type", 0)) != 2:
+                continue
 
-    resp_groups = get_glpi(f"Ticket/{ticket_id}/Group_Ticket", session_token)
-    if resp_groups.ok:
+            groups_id = int(item.get("groups_id"))
+            grupos.append({
+                "id": groups_id,
+                "nome": buscar_nome_grupo(groups_id, session_token)
+            })
+        except Exception:
+            continue
+
+    unicos = {}
+    for grupo in grupos:
+        unicos[grupo["id"]] = grupo
+
+    return list(unicos.values())
+
+
+def buscar_tecnicos_ticket(ticket_id, session_token):
+    tecnicos = []
+
+    response = get_glpi(f"Ticket/{ticket_id}/Ticket_User", session_token)
+    if not response.ok:
+        return tecnicos
+
+    try:
+        itens = normalizar_lista_api(response.json())
+    except Exception:
+        return tecnicos
+
+    for item in itens:
         try:
-            for item in resp_groups.json():
-                if int(item.get("type", 0)) == 2:
-                    nome = buscar_nome_grupo(item.get("groups_id"), session_token)
-                    if nome:
-                        grupos.append(nome)
-        except Exception as e:
-            print("Erro Group_Ticket:", e)
-            print("Resposta Group_Ticket:", resp_groups.text)
+            if int(item.get("type", 0)) != 2:
+                continue
 
-    return list(dict.fromkeys(grupos)), list(dict.fromkeys(tecnicos))
+            users_id = int(item.get("users_id"))
+            usuario = buscar_usuario(users_id, session_token)
+            tecnicos.append(usuario)
+        except Exception:
+            continue
 
-
-def formatar_tecnicos(tecnicos):
-    saida = []
+    unicos = {}
     for tecnico in tecnicos:
-        saida.append(MAPA_TECNICOS.get(tecnico, tecnico))
-    return ", ".join(saida) if saida else "Nao informado"
+        unicos[tecnico["id"]] = tecnico
+
+    return list(unicos.values())
 
 
-def montar_mensagem(ticket, grupos, tecnicos):
-    ticket_id = ticket.get("id", "Nao informado")
+def obter_valor_caminho(dados, caminho):
+    atual = dados
+    for chave in caminho:
+        if not isinstance(atual, dict):
+            return None
+        atual = atual.get(chave)
+        if atual is None:
+            return None
+    return atual
+
+
+def extrair_ticket_id(payload):
+    if not isinstance(payload, dict):
+        return None
+
+    caminhos = [
+        ("ticket_id",),
+        ("tickets_id",),
+        ("items_id",),
+        ("ticket", "id"),
+        ("item", "ticket_id"),
+        ("data", "ticket_id"),
+        ("data", "tickets_id"),
+        ("data", "items_id"),
+        ("input", "ticket_id"),
+        ("input", "tickets_id"),
+        ("input", "items_id"),
+        ("item", "id"),
+        ("data", "id"),
+        ("input", "id"),
+        ("id",),
+    ]
+
+    for caminho in caminhos:
+        valor = obter_valor_caminho(payload, caminho)
+        if valor is None:
+            continue
+
+        try:
+            return int(valor)
+        except Exception:
+            continue
+
+    return None
+
+
+async def ler_payload_request(request: Request):
+    content_type = (request.headers.get("content-type") or "").lower()
+
+    if "application/json" in content_type:
+        try:
+            return await request.json()
+        except Exception:
+            pass
+
+    if "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
+        try:
+            form = await request.form()
+            return dict(form)
+        except Exception:
+            pass
+
+    try:
+        body = await request.body()
+        if body:
+            texto = body.decode("utf-8", errors="ignore")
+            try:
+                return json.loads(texto)
+            except Exception:
+                return {"raw_body": texto}
+    except Exception:
+        pass
+
+    return {}
+
+
+def montar_mensagem_grupo(ticket, grupo, tecnicos):
+    ticket_id = ticket.get("id")
     titulo = ticket.get("name") or "Sem titulo"
-    status = traduzir_status(ticket.get("status"))
-    prioridade = ticket.get("priority", "Nao informado")
-    grupo_txt = ", ".join(grupos) if grupos else "Nao informado"
-    tecnico_txt = formatar_tecnicos(tecnicos)
     link = f"{GLPI_URL_BASE}/front/ticket.form.php?id={ticket_id}"
 
+    tecnico_txt = ", ".join([formatar_tecnico(t) for t in tecnicos]) if tecnicos else "Nao informado"
+
     return (
-        f"Novo evento de chamado\n\n"
-        f"Grupo: {grupo_txt}\n"
+        f"Grupo atribuido ao chamado\n\n"
+        f"Grupo: {grupo['nome']}\n"
         f"Tecnico: {tecnico_txt}\n"
         f"Id: {ticket_id}\n"
         f"Titulo: {titulo}\n"
-        f"Status: {status}\n"
-        f"Prioridade: {prioridade}\n"
+        f"Link: {link}"
+    )
+
+
+def montar_mensagem_tecnico(ticket, grupos, tecnico):
+    ticket_id = ticket.get("id")
+    titulo = ticket.get("name") or "Sem titulo"
+    link = f"{GLPI_URL_BASE}/front/ticket.form.php?id={ticket_id}"
+    grupo_txt = ", ".join([g["nome"] for g in grupos]) if grupos else "Nao informado"
+
+    return (
+        f"Tecnico atribuido ao chamado\n\n"
+        f"Grupo: {grupo_txt}\n"
+        f"Tecnico: {formatar_tecnico(tecnico)}\n"
+        f"Id: {ticket_id}\n"
+        f"Titulo: {titulo}\n"
         f"Link: {link}"
     )
 
@@ -247,43 +390,92 @@ def home():
 
 
 @app.post("/webhook")
-def webhook(payload: WebhookPayload):
+async def webhook(request: Request):
     try:
-        ticket_id_raw = (
-            payload.id
-            or payload.ticket_id
-            or payload.tickets_id
-            or (payload.item.id if payload.item else None)
-        )
+        payload = await ler_payload_request(request)
+        ticket_id = extrair_ticket_id(payload)
 
-        if not ticket_id_raw:
+        if not ticket_id:
             return {
                 "status": "erro",
                 "recebido": False,
-                "erro": "Informe id, ticket_id, tickets_id ou item.id",
-                "payload_recebido": payload.model_dump()
+                "erro": "Nao foi possivel identificar o ticket_id no payload",
+                "payload_recebido": payload,
+                "data_recebimento": datetime.now().strftime("%d/%m/%Y %H:%M:%S")
             }
-
-        ticket_id = int(ticket_id_raw)
 
         session_token = iniciar_sessao_glpi()
 
         try:
             ticket = buscar_ticket(ticket_id, session_token)
-            grupos, tecnicos = buscar_grupos_tecnicos(ticket_id, session_token)
-            texto = montar_mensagem(ticket, grupos, tecnicos)
-            telegram = enviar_telegram(texto)
+            grupos_ticket = buscar_grupos_ticket(ticket_id, session_token)
+            tecnicos_ticket = buscar_tecnicos_ticket(ticket_id, session_token)
+
+            ticket_key = str(ticket_id)
+            estado_ticket = ESTADO["tickets"].get(ticket_key, {
+                "grupos": [],
+                "tecnicos": []
+            })
+
+            grupos_anteriores = set(int(x) for x in estado_ticket.get("grupos", []))
+            tecnicos_anteriores = set(int(x) for x in estado_ticket.get("tecnicos", []))
+
+            grupos_atuais = set(g["id"] for g in grupos_ticket)
+            tecnicos_atuais = set(t["id"] for t in tecnicos_ticket)
+
+            novos_grupos = [g for g in grupos_ticket if g["id"] not in grupos_anteriores]
+            novos_tecnicos = [t for t in tecnicos_ticket if t["id"] not in tecnicos_anteriores]
+
+            alertas_enviados = []
+
+            for grupo in novos_grupos:
+                texto = montar_mensagem_grupo(ticket, grupo, tecnicos_ticket)
+                telegram = enviar_telegram(texto)
+
+                alertas_enviados.append({
+                    "tipo": "atribuicao_grupo",
+                    "grupo_id": grupo["id"],
+                    "grupo_nome": grupo["nome"],
+                    "mensagem": texto,
+                    "telegram": telegram
+                })
+
+            for tecnico in novos_tecnicos:
+                texto = montar_mensagem_tecnico(ticket, grupos_ticket, tecnico)
+                telegram = enviar_telegram(texto)
+
+                alertas_enviados.append({
+                    "tipo": "atribuicao_tecnico",
+                    "tecnico_id": tecnico["id"],
+                    "tecnico_nome": tecnico["nome"],
+                    "mensagem": texto,
+                    "telegram": telegram
+                })
+
+            ESTADO["tickets"][ticket_key] = {
+                "grupos": sorted(list(grupos_atuais)),
+                "tecnicos": sorted(list(tecnicos_atuais))
+            }
+            salvar_estado(ESTADO)
+
+            if alertas_enviados:
+                return {
+                    "status": "ok",
+                    "recebido": True,
+                    "ticket_id": ticket_id,
+                    "tipo_alerta": "atribuicao",
+                    "payload_recebido": payload,
+                    "alertas_enviados": alertas_enviados,
+                    "data_recebimento": datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+                }
 
             return {
                 "status": "ok",
                 "recebido": True,
                 "ticket_id": ticket_id,
-                "payload_recebido": payload.model_dump(),
-                "ticket": ticket,
-                "grupos": grupos,
-                "tecnicos": tecnicos,
-                "mensagem_enviada": texto,
-                "telegram": telegram,
+                "tipo_alerta": "sem_alerta",
+                "motivo": "Sem nova atribuicao de grupo ou tecnico",
+                "payload_recebido": payload,
                 "data_recebimento": datetime.now().strftime("%d/%m/%Y %H:%M:%S")
             }
 

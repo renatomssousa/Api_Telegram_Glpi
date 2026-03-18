@@ -1,0 +1,10 @@
+{
+  "intervalo_segundos": 300,
+  "sla_percent_alerta": 20,
+  "db": {
+    "host": "192.168.1.206",
+    "user": "glpi",
+    "pass": "glpi",
+    "name": "glpi"
+  }
+}
