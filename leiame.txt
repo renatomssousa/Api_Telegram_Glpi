@@ -1,0 +1,36 @@
+Ativar e iniciar
+sudo systemctl daemon-reload
+sudo systemctl enable glpi-api.service glpi-monitor.service
+sudo systemctl start glpi-api.service glpi-monitor.service
+4. Ver status
+sudo systemctl status glpi-api.service
+sudo systemctl status glpi-monitor.service
+5. Ver logs
+journalctl -u glpi-api.service -f
+journalctl -u glpi-monitor.service -f
+6. Comandos do dia a dia
+
+Iniciar:
+
+sudo systemctl start glpi-api.service glpi-monitor.service
+
+Parar:
+
+sudo systemctl stop glpi-api.service glpi-monitor.service
+
+Reiniciar:
+
+sudo systemctl restart glpi-api.service glpi-monitor.service
+
+Subir automático no boot:
+
+sudo systemctl enable glpi-api.service glpi-monitor.service
+
+Observação importante:
+no service do uvicorn não use --reload, porque isso é só para desenvolvimento.
+
+Antes de iniciar, confirme se esses arquivos existem:
+
+ls /home/glpi/Api_Telegram_Glpi
+ls /home/glpi/Api_Telegram_Glpi/venv/bin/uvicorn
+ls /home/glpi/Api_Telegram_Glpi/venv/bin/python
